@@ -15,7 +15,10 @@ config.set_main_option(
     get_settings().database_url.replace("%", "%%"),
 )
 
-target_metadata = None
+from app.database.base import Base
+from app.database import models  # noqa: F401
+
+target_metadata = Base.metadata
 
 
 def run_migrations_offline() -> None:
