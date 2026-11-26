@@ -1,3 +1,11 @@
+"""Integration tests for the base memory schema (Phase A).
+
+These tests have been updated for Phase B1 — Claim and MemoryGeneration now
+require a workspace_id.  The semantic assertions are identical to the
+original; only the fixture construction has been updated to supply the
+required workspace owner.
+"""
+
 import os
 
 import pytest
@@ -48,6 +56,10 @@ def db():
 
 @pytest.mark.integration
 def test_claim_versions_preserve_history(db):
+    ws = MemoryWorkspace(workspace_key="schema-history")
+    db.add(ws)
+    db.flush()
+
     source = Source(
         filename="supplier-record.txt",
         source_type="document",
@@ -55,6 +67,7 @@ def test_claim_versions_preserve_history(db):
         trust_status="verified",
     )
     claim = Claim(
+        workspace_id=ws.id,
         subject_key="supplier-001",
         field_key="payment_terms",
     )
@@ -94,8 +107,13 @@ def test_claim_versions_preserve_history(db):
 
 @pytest.mark.integration
 def test_duplicate_claim_identity_is_rejected(db):
+    ws = MemoryWorkspace(workspace_key="schema-dup")
+    db.add(ws)
+    db.flush()
+
     db.add(
         Claim(
+            workspace_id=ws.id,
             subject_key="supplier-002",
             field_key="approval_status",
         )
@@ -105,6 +123,7 @@ def test_duplicate_claim_identity_is_rejected(db):
     with pytest.raises(IntegrityError), db.begin_nested():
         db.add(
             Claim(
+                workspace_id=ws.id,
                 subject_key="supplier-002",
                 field_key="approval_status",
             )
@@ -114,6 +133,10 @@ def test_duplicate_claim_identity_is_rejected(db):
 
 @pytest.mark.integration
 def test_memory_generation_references_version(db):
+    ws = MemoryWorkspace(workspace_key="schema-gen")
+    db.add(ws)
+    db.flush()
+
     source = Source(
         filename="approved-record.txt",
         source_type="document",
@@ -121,6 +144,7 @@ def test_memory_generation_references_version(db):
         trust_status="verified",
     )
     claim = Claim(
+        workspace_id=ws.id,
         subject_key="supplier-003",
         field_key="bank_account",
     )
@@ -135,7 +159,7 @@ def test_memory_generation_references_version(db):
         source_id=source.id,
         trust_status="verified",
     )
-    generation = MemoryGeneration(state="active")
+    generation = MemoryGeneration(workspace_id=ws.id, state="active")
 
     db.add_all([version, generation])
     db.flush()
@@ -143,19 +167,14 @@ def test_memory_generation_references_version(db):
     db.add(
         GenerationClaimVersion(
             generation_id=generation.id,
+            workspace_id=ws.id,
             claim_id=claim.id,
             version_id=version.id,
         )
     )
 
-    db.add(
-        MemoryWorkspace(
-            workspace_key="test-procurepilot",
-            active_generation_id=generation.id,
-            revision=1,
-        )
-    )
-
+    ws.active_generation_id = generation.id
+    ws.revision = 1
     db.flush()
 
     stored = db.scalar(

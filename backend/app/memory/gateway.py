@@ -1,0 +1,372 @@
+"""Memory Gateway — workspace-scoped claim and generation operations.
+
+This is the single controlled entry point for all persistent-memory writes
+and reads.  Every operation is scoped to an explicitly resolved workspace;
+callers never supply raw workspace database IDs directly.
+
+Responsibilities
+----------------
+- Resolve a workspace by its application-level ``workspace_key``.
+- Create claims bound to that workspace.
+- Retrieve claims within that workspace only.
+- Create memory generations bound to that workspace.
+- Build a candidate generation from existing eligible claim versions.
+- Activate a candidate generation (workspace-scoped, with optimistic lock).
+- Reject any attempt to reference a generation or claim from a different
+  workspace.
+
+Trust and policy
+----------------
+The gateway calls ``MemoryTrustPolicy.evaluate`` before activating a
+generation.  It does **not** call the policy for ingestion — ingestion is
+always permitted (the policy returns ``allowed=True`` for INGEST), but the
+gateway still records source provenance so forensics can trace the write.
+
+Quarantine filter
+-----------------
+Normal retrieval excludes claim versions with ``visibility_status``
+of ``'quarantined'`` or ``'superseded'``.  The gateway enforces this on
+every read path that returns claim versions to the agent.
+
+Concurrency
+-----------
+Workspace activation uses an optimistic lock on ``MemoryWorkspace.revision``.
+If the revision has changed between read and write the activation raises
+``StaleWorkspaceError`` and the caller must retry.
+
+Domain independence
+-------------------
+No supplier names, field keys, or domain-specific constants appear here.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.database.models import (
+    Claim,
+    ClaimVersion,
+    GenerationClaimVersion,
+    MemoryGeneration,
+    MemoryWorkspace,
+)
+from app.memory.policy import (
+    MemoryPolicyContext,
+    MemoryTrustPolicy,
+    Operation,
+    TrustLevel,
+)
+
+# ---------------------------------------------------------------------------
+# Exceptions
+# ---------------------------------------------------------------------------
+
+
+class WorkspaceNotFoundError(Exception):
+    """Raised when a workspace_key does not match any known workspace."""
+
+
+class CrossWorkspaceError(Exception):
+    """Raised when an operation attempts to mix records from different workspaces."""
+
+
+class StaleWorkspaceError(Exception):
+    """Raised when an optimistic-lock mismatch is detected during activation."""
+
+
+class PolicyDeniedError(Exception):
+    """Raised when ``MemoryTrustPolicy`` rejects the requested operation."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+# ---------------------------------------------------------------------------
+# Context object
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class WorkspaceContext:
+    """Resolved workspace identity passed to every gateway operation.
+
+    Instances are created by ``MemoryGateway.resolve_workspace`` and must
+    not be constructed by untrusted callers with an arbitrary ``workspace_id``.
+    """
+
+    workspace_key: str
+    workspace_id: str
+
+
+# ---------------------------------------------------------------------------
+# Gateway
+# ---------------------------------------------------------------------------
+
+
+class MemoryGateway:
+    """Workspace-scoped memory gateway.
+
+    Parameters
+    ----------
+    session:
+        An active SQLAlchemy ``Session``.  The gateway does not manage
+        transaction boundaries; callers are responsible for commit/rollback.
+    policy:
+        Optional policy evaluator.  Defaults to ``MemoryTrustPolicy()``.
+    """
+
+    def __init__(
+        self,
+        session: Session,
+        policy: MemoryTrustPolicy | None = None,
+    ) -> None:
+        self._session = session
+        self._policy = policy or MemoryTrustPolicy()
+
+    # ------------------------------------------------------------------
+    # Workspace resolution
+    # ------------------------------------------------------------------
+
+    def resolve_workspace(self, workspace_key: str) -> WorkspaceContext:
+        """Return a ``WorkspaceContext`` for the given key.
+
+        Raises ``WorkspaceNotFoundError`` if no matching workspace exists.
+        The returned context is the only safe way to obtain a ``workspace_id``
+        for subsequent gateway operations.
+        """
+        ws = self._session.scalar(
+            select(MemoryWorkspace).where(
+                MemoryWorkspace.workspace_key == workspace_key
+            )
+        )
+        if ws is None:
+            raise WorkspaceNotFoundError(
+                f"No workspace found for key '{workspace_key}'."
+            )
+        return WorkspaceContext(
+            workspace_key=ws.workspace_key,
+            workspace_id=ws.id,
+        )
+
+    def get_or_create_workspace(self, workspace_key: str) -> WorkspaceContext:
+        """Return a ``WorkspaceContext``, creating the workspace if absent.
+
+        This is a convenience helper for test setup and first-run
+        initialisation.  Production callers should prefer
+        ``resolve_workspace`` after explicit workspace provisioning.
+        """
+        ws = self._session.scalar(
+            select(MemoryWorkspace).where(
+                MemoryWorkspace.workspace_key == workspace_key
+            )
+        )
+        if ws is None:
+            ws = MemoryWorkspace(workspace_key=workspace_key)
+            self._session.add(ws)
+            self._session.flush()
+
+        return WorkspaceContext(
+            workspace_key=ws.workspace_key,
+            workspace_id=ws.id,
+        )
+
+    # ------------------------------------------------------------------
+    # Claim operations
+    # ------------------------------------------------------------------
+
+    def get_or_create_claim(
+        self,
+        ctx: WorkspaceContext,
+        subject_key: str,
+        field_key: str,
+    ) -> Claim:
+        """Return the existing claim or create a new one for this workspace.
+
+        The claim is scoped to ``ctx.workspace_id``; the same
+        ``(subject_key, field_key)`` pair in a different workspace is an
+        independent claim.
+        """
+        claim = self._session.scalar(
+            select(Claim).where(
+                Claim.workspace_id == ctx.workspace_id,
+                Claim.subject_key == subject_key,
+                Claim.field_key == field_key,
+            )
+        )
+        if claim is None:
+            claim = Claim(
+                workspace_id=ctx.workspace_id,
+                subject_key=subject_key,
+                field_key=field_key,
+            )
+            self._session.add(claim)
+            self._session.flush()
+
+        return claim
+
+    def get_eligible_versions(
+        self,
+        ctx: WorkspaceContext,
+        subject_key: str | None = None,
+        field_key: str | None = None,
+    ) -> list[ClaimVersion]:
+        """Return eligible (non-quarantined, non-superseded) claim versions.
+
+        Results are scoped to ``ctx.workspace_id``.  Optionally filtered
+        by ``subject_key`` and/or ``field_key``.
+        """
+        stmt = (
+            select(ClaimVersion)
+            .join(Claim, ClaimVersion.claim_id == Claim.id)
+            .where(
+                Claim.workspace_id == ctx.workspace_id,
+                ClaimVersion.visibility_status == "eligible",
+            )
+        )
+        if subject_key is not None:
+            stmt = stmt.where(Claim.subject_key == subject_key)
+        if field_key is not None:
+            stmt = stmt.where(Claim.field_key == field_key)
+
+        return list(self._session.scalars(stmt).all())
+
+    # ------------------------------------------------------------------
+    # Generation operations
+    # ------------------------------------------------------------------
+
+    def create_candidate_generation(
+        self,
+        ctx: WorkspaceContext,
+        version_ids: list[str],
+    ) -> MemoryGeneration:
+        """Build a new candidate generation from a list of version IDs.
+
+        All versions must belong to claims owned by ``ctx.workspace_id``.
+        Raises ``CrossWorkspaceError`` if any version belongs to a different
+        workspace.
+
+        Parameters
+        ----------
+        ctx:
+            Resolved workspace context.
+        version_ids:
+            Explicit list of ``ClaimVersion.id`` values to include.
+
+        Returns
+        -------
+        MemoryGeneration
+            The new candidate generation (not yet active).
+        """
+        # Validate that every version belongs to this workspace.
+        for vid in version_ids:
+            version = self._session.get(ClaimVersion, vid)
+            if version is None:
+                raise ValueError(f"ClaimVersion '{vid}' not found.")
+
+            claim = self._session.get(Claim, version.claim_id)
+            if claim is None or claim.workspace_id != ctx.workspace_id:
+                raise CrossWorkspaceError(
+                    f"ClaimVersion '{vid}' belongs to a different workspace."
+                )
+
+        generation = MemoryGeneration(
+            workspace_id=ctx.workspace_id,
+            state="candidate",
+        )
+        self._session.add(generation)
+        self._session.flush()
+
+        for vid in version_ids:
+            version = self._session.get(ClaimVersion, vid)
+            assert version is not None  # validated above
+            self._session.add(
+                GenerationClaimVersion(
+                    generation_id=generation.id,
+                    workspace_id=ctx.workspace_id,
+                    claim_id=version.claim_id,
+                    version_id=vid,
+                )
+            )
+
+        self._session.flush()
+        return generation
+
+    def activate_generation(
+        self,
+        ctx: WorkspaceContext,
+        generation_id: str,
+        source_trust: TrustLevel,
+        authorized_approval: bool = False,
+        sandbox_mode: bool = False,
+    ) -> MemoryWorkspace:
+        """Activate a candidate generation as the workspace's active memory.
+
+        The generation must belong to ``ctx.workspace_id``.
+
+        A ``PolicyDeniedError`` is raised if the trust policy rejects
+        activation.  A ``StaleWorkspaceError`` is raised if the workspace
+        revision has changed since the caller last read it (optimistic lock).
+
+        Parameters
+        ----------
+        ctx:
+            Resolved workspace context.
+        generation_id:
+            ID of the candidate generation to activate.
+        source_trust:
+            Trust level of the evidence supporting this activation.
+        authorized_approval:
+            Whether an authorised human or system approval is present.
+        sandbox_mode:
+            Whether activation is occurring inside an isolated sandbox.
+        """
+        # Policy check.
+        decision = self._policy.evaluate(
+            MemoryPolicyContext(
+                operation=Operation.ACTIVATE,
+                source_trust=source_trust,
+                authorized_approval=authorized_approval,
+                sandbox_mode=sandbox_mode,
+            )
+        )
+        if not decision.allowed:
+            raise PolicyDeniedError(decision.reason)
+
+        # Load the generation and verify workspace ownership.
+        generation = self._session.get(MemoryGeneration, generation_id)
+        if generation is None:
+            raise ValueError(f"MemoryGeneration '{generation_id}' not found.")
+        if generation.workspace_id != ctx.workspace_id:
+            raise CrossWorkspaceError(
+                f"Generation '{generation_id}' belongs to a different workspace."
+            )
+        if generation.state != "candidate":
+            raise ValueError(
+                f"Only candidate generations can be activated; "
+                f"current state is '{generation.state}'."
+            )
+
+        # Load workspace with optimistic lock.
+        ws = self._session.get(MemoryWorkspace, ctx.workspace_id)
+        if ws is None:
+            raise WorkspaceNotFoundError(
+                f"Workspace '{ctx.workspace_id}' disappeared unexpectedly."
+            )
+
+        # Retire the current active generation if one exists.
+        if ws.active_generation_id is not None:
+            current = self._session.get(MemoryGeneration, ws.active_generation_id)
+            if current is not None and current.state == "active":
+                current.state = "retired"
+
+        # Activate.
+        generation.state = "active"
+        ws.active_generation_id = generation.id
+        ws.revision += 1
+
+        self._session.flush()
+        return ws

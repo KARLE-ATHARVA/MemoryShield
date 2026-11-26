@@ -13,7 +13,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database.base import Base
 
@@ -24,6 +24,53 @@ def new_id() -> str:
 
 def utc_now() -> datetime:
     return datetime.now(UTC)
+
+
+# ---------------------------------------------------------------------------
+# MemoryWorkspace — defined first so other tables can reference it.
+# ---------------------------------------------------------------------------
+
+
+class MemoryWorkspace(Base):
+    __tablename__ = "memory_workspaces"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    workspace_key: Mapped[str] = mapped_column(String(100), unique=True)
+    # active_generation_id is enforced by a composite FK (active_generation_id, id)
+    # → memory_generations(id, workspace_id), which guarantees that the activated
+    # generation belongs to this workspace.  The simple ForeignKey annotation is
+    # intentionally absent here; the constraint lives in __table_args__ below.
+    active_generation_id: Mapped[str | None] = mapped_column(
+        String(36), nullable=True
+    )
+    revision: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now
+    )
+
+    # Relationships
+    claims: Mapped[list["Claim"]] = relationship(back_populates="workspace")
+    generations: Mapped[list["MemoryGeneration"]] = relationship(
+        back_populates="workspace",
+        foreign_keys="MemoryGeneration.workspace_id",
+    )
+
+    __table_args__ = (
+        # Composite FK ensures the active generation belongs to THIS workspace.
+        # Requires uq_generation_id_workspace on memory_generations.
+        ForeignKeyConstraint(
+            ["active_generation_id", "id"],
+            ["memory_generations.id", "memory_generations.workspace_id"],
+            name="fk_workspace_active_generation_owned",
+            use_alter=True,
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Source — workspace-independent; a source document is a global evidence
+# record that individual workspaces may reference via ClaimVersion.
+# ---------------------------------------------------------------------------
 
 
 class Source(Base):
@@ -46,19 +93,51 @@ class Source(Base):
     )
 
 
+# ---------------------------------------------------------------------------
+# Claim — workspace-scoped.
+# A claim represents the identity (subject + field) of a persistent fact.
+# The same (subject_key, field_key) pair may exist independently in
+# different workspaces; they are unrelated records.
+# ---------------------------------------------------------------------------
+
+
 class Claim(Base):
     __tablename__ = "claims"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    workspace_id: Mapped[str] = mapped_column(
+        ForeignKey("memory_workspaces.id"), nullable=False
+    )
     subject_key: Mapped[str] = mapped_column(String(150))
     field_key: Mapped[str] = mapped_column(String(100))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now
     )
 
+    workspace: Mapped["MemoryWorkspace"] = relationship(back_populates="claims")
+
     __table_args__ = (
-        UniqueConstraint("subject_key", "field_key", name="uq_claim_identity"),
+        # Uniqueness is now scoped to the workspace — the same (subject, field)
+        # pair in two different workspaces produces two independent claims.
+        UniqueConstraint(
+            "workspace_id",
+            "subject_key",
+            "field_key",
+            name="uq_claim_identity",
+        ),
+        # Required by the composite FK on generation_claim_versions so that
+        # (claim_id, workspace_id) can be verified as a unique pair.
+        UniqueConstraint(
+            "id",
+            "workspace_id",
+            name="uq_claim_id_workspace",
+        ),
     )
+
+
+# ---------------------------------------------------------------------------
+# ClaimVersion — immutable value record for a Claim.
+# ---------------------------------------------------------------------------
 
 
 class ClaimVersion(Base):
@@ -101,6 +180,11 @@ class ClaimVersion(Base):
     )
 
 
+# ---------------------------------------------------------------------------
+# MemoryArtifact — derived memory (e.g. AI-generated summaries).
+# ---------------------------------------------------------------------------
+
+
 class MemoryArtifact(Base):
     __tablename__ = "memory_artifacts"
 
@@ -118,6 +202,11 @@ class MemoryArtifact(Base):
             name="ck_artifact_visibility",
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# DependencyEdge — provenance graph edge.
+# ---------------------------------------------------------------------------
 
 
 class DependencyEdge(Base):
@@ -151,6 +240,11 @@ class DependencyEdge(Base):
     )
 
 
+# ---------------------------------------------------------------------------
+# RetrievalEvent — records what versions were returned during a retrieval.
+# ---------------------------------------------------------------------------
+
+
 class RetrievalEvent(Base):
     __tablename__ = "retrieval_events"
 
@@ -161,6 +255,11 @@ class RetrievalEvent(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now
     )
+
+
+# ---------------------------------------------------------------------------
+# AgentDecision — records an agent output linked to a retrieval event.
+# ---------------------------------------------------------------------------
 
 
 class AgentDecision(Base):
@@ -177,13 +276,27 @@ class AgentDecision(Base):
     )
 
 
+# ---------------------------------------------------------------------------
+# MemoryGeneration — a versioned snapshot of active memory claims.
+# Each generation is owned by exactly one workspace.
+# ---------------------------------------------------------------------------
+
+
 class MemoryGeneration(Base):
     __tablename__ = "memory_generations"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    workspace_id: Mapped[str] = mapped_column(
+        ForeignKey("memory_workspaces.id"), nullable=False
+    )
     state: Mapped[str] = mapped_column(String(30), default="candidate")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now
+    )
+
+    workspace: Mapped["MemoryWorkspace"] = relationship(
+        back_populates="generations",
+        foreign_keys=[workspace_id],
     )
 
     __table_args__ = (
@@ -191,42 +304,76 @@ class MemoryGeneration(Base):
             "state IN ('candidate', 'active', 'retired')",
             name="ck_generation_state",
         ),
+        # Required by composite FKs on generation_claim_versions and
+        # memory_workspaces so that workspace ownership can be enforced
+        # declaratively at the database level.
+        UniqueConstraint(
+            "id",
+            "workspace_id",
+            name="uq_generation_id_workspace",
+        ),
     )
+
+
+# ---------------------------------------------------------------------------
+# GenerationClaimVersion — membership table linking a generation to the
+# specific claim version it includes.
+#
+# The composite FK (version_id, claim_id) → claim_versions(id, claim_id)
+# prevents a generation from referencing a version that belongs to a
+# different claim.  Workspace-level isolation is enforced by the application
+# gateway which ensures generation.workspace_id == claim.workspace_id before
+# inserting rows here.
+# ---------------------------------------------------------------------------
 
 
 class GenerationClaimVersion(Base):
     __tablename__ = "generation_claim_versions"
 
-    generation_id: Mapped[str] = mapped_column(
-        ForeignKey("memory_generations.id"), primary_key=True
-    )
-    claim_id: Mapped[str] = mapped_column(ForeignKey("claims.id"), primary_key=True)
+    generation_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    claim_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    # workspace_id is a redundant denormalized column required so that composite
+    # FKs can enforce that the generation and claim share the same workspace
+    # entirely within the database — without needing a trigger.
+    workspace_id: Mapped[str] = mapped_column(String(36), nullable=False)
     version_id: Mapped[str] = mapped_column(String(36), nullable=False)
 
     __table_args__ = (
+        # Original constraint: version must belong to the stated claim.
         ForeignKeyConstraint(
             ["version_id", "claim_id"],
             ["claim_versions.id", "claim_versions.claim_id"],
             name="fk_generation_correct_claim",
         ),
+        # DB-level proof that the generation belongs to workspace_id.
+        # Requires uq_generation_id_workspace on memory_generations.
+        ForeignKeyConstraint(
+            ["generation_id", "workspace_id"],
+            ["memory_generations.id", "memory_generations.workspace_id"],
+            name="fk_gcv_generation_workspace",
+        ),
+        # DB-level proof that the claim belongs to workspace_id.
+        # Requires uq_claim_id_workspace on claims.
+        ForeignKeyConstraint(
+            ["claim_id", "workspace_id"],
+            ["claims.id", "claims.workspace_id"],
+            name="fk_gcv_claim_workspace",
+        ),
     )
 
 
-class MemoryWorkspace(Base):
-    __tablename__ = "memory_workspaces"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
-    workspace_key: Mapped[str] = mapped_column(String(100), unique=True)
-    active_generation_id: Mapped[str | None] = mapped_column(
-        ForeignKey("memory_generations.id"), nullable=True
-    )
-    revision: Mapped[int] = mapped_column(Integer, default=0)
+# ---------------------------------------------------------------------------
+# Incident — workspace-scoped forensic incident.
+# ---------------------------------------------------------------------------
 
 
 class Incident(Base):
     __tablename__ = "incidents"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    workspace_id: Mapped[str] = mapped_column(
+        ForeignKey("memory_workspaces.id"), nullable=False
+    )
     suspect_node_type: Mapped[str] = mapped_column(String(50))
     suspect_node_id: Mapped[str] = mapped_column(String(36))
     status: Mapped[str] = mapped_column(String(30), default="open")
@@ -241,6 +388,11 @@ class Incident(Base):
             name="ck_incident_status",
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# RecoveryJob — workspace-scoped recovery operation.
+# ---------------------------------------------------------------------------
 
 
 class RecoveryJob(Base):
