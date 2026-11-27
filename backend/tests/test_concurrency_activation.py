@@ -198,9 +198,7 @@ def test_two_transactions_cannot_activate_stale_candidates():
         # Persist setup so independent connections can see the records.
         with Session(engine) as session, session.begin():
             gateway = MemoryGateway(session)
-            ctx = gateway.get_or_create_workspace(
-                f"b13-concurrent-{uuid4()}"
-            )
+            ctx = gateway.get_or_create_workspace(f"b13-concurrent-{uuid4()}")
             workspace_id = ctx.workspace_id
 
             first = gateway.create_candidate_generation(ctx, [])
@@ -255,16 +253,13 @@ def test_two_transactions_cannot_activate_stale_candidates():
         # created by this test. Never touch application data.
         if workspace_id is not None:
             with Session(engine) as session, session.begin():
-                workspace = session.get(
-                    MemoryWorkspace, workspace_id
-                )
+                workspace = session.get(MemoryWorkspace, workspace_id)
                 if workspace is not None:
                     workspace.active_generation_id = None
                     session.flush()
                     session.execute(
                         delete(MemoryGeneration).where(
-                            MemoryGeneration.workspace_id
-                            == workspace_id
+                            MemoryGeneration.workspace_id == workspace_id
                         )
                     )
                     session.delete(workspace)

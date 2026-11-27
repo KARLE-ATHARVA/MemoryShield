@@ -26,9 +26,7 @@ def db():
         pytest.fail("TEST_DATABASE_URL is required")
 
     if make_url(url).database != "memoryshield_test":
-        raise RuntimeError(
-            "Refusing to run against a non-test database"
-        )
+        raise RuntimeError("Refusing to run against a non-test database")
 
     engine = create_engine(url, pool_pre_ping=True)
     connection = engine.connect()
@@ -48,9 +46,7 @@ def db():
 
 @pytest.fixture
 def evidence(db):
-    workspace = MemoryWorkspace(
-        workspace_key="immutability-test-workspace"
-    )
+    workspace = MemoryWorkspace(workspace_key="immutability-test-workspace")
     source = Source(
         filename="original.txt",
         source_type="document",
@@ -141,15 +137,15 @@ def evidence(db):
 def test_direct_sql_cannot_modify_historical_evidence(
     db, evidence, table, column, replacement
 ):
-    with pytest.raises(
-        IntegrityError,
-        match="Historical evidence is append-only",
-    ), db.begin_nested():
+    with (
+        pytest.raises(
+            IntegrityError,
+            match="Historical evidence is append-only",
+        ),
+        db.begin_nested(),
+    ):
         db.execute(
-            text(
-                f"UPDATE {table} SET {column} = :replacement "
-                "WHERE id = :record_id"
-            ),
+            text(f"UPDATE {table} SET {column} = :replacement WHERE id = :record_id"),
             {
                 "replacement": replacement,
                 "record_id": evidence[table],
@@ -170,13 +166,14 @@ def test_direct_sql_cannot_modify_historical_evidence(
         "agent_decisions",
     ],
 )
-def test_direct_sql_cannot_delete_historical_evidence(
-    db, evidence, table
-):
-    with pytest.raises(
-        IntegrityError,
-        match="Historical evidence is append-only",
-    ), db.begin_nested():
+def test_direct_sql_cannot_delete_historical_evidence(db, evidence, table):
+    with (
+        pytest.raises(
+            IntegrityError,
+            match="Historical evidence is append-only",
+        ),
+        db.begin_nested(),
+    ):
         db.execute(
             text(f"DELETE FROM {table} WHERE id = :record_id"),
             {"record_id": evidence[table]},
@@ -251,17 +248,11 @@ def test_corrected_claim_creates_new_version(db, evidence):
 
 
 @pytest.mark.integration
-def test_source_trust_status_can_change_without_rewriting_evidence(
-    db, evidence
-):
+def test_source_trust_status_can_change_without_rewriting_evidence(db, evidence):
     source_id = evidence["sources"]
 
     db.execute(
-        text(
-            "UPDATE sources "
-            "SET trust_status = 'disputed' "
-            "WHERE id = :source_id"
-        ),
+        text("UPDATE sources SET trust_status = 'disputed' WHERE id = :source_id"),
         {"source_id": source_id},
     )
 

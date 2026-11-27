@@ -561,9 +561,7 @@ def test_gateway_activation_policy_denied_for_unverified(db):
     gen = gw.create_candidate_generation(ctx, [ver.id])
 
     with pytest.raises(PolicyDeniedError):
-        gw.activate_generation(
-            ctx, gen.id, source_trust=TrustLevel.UNVERIFIED
-        )
+        gw.activate_generation(ctx, gen.id, source_trust=TrustLevel.UNVERIFIED)
 
 
 # ===========================================================================
@@ -720,9 +718,7 @@ def test_db_rejects_generation_membership_from_different_workspace(db):
     db.flush()
 
     source = _make_source(db, "b1")
-    claim_a = Claim(
-        workspace_id=ws_a.id, subject_key="s-b11-g", field_key="f1"
-    )
+    claim_a = Claim(workspace_id=ws_a.id, subject_key="s-b11-g", field_key="f1")
     db.add(claim_a)
     db.flush()
 
@@ -763,9 +759,7 @@ def test_db_rejects_claim_membership_from_different_workspace(db):
 
     source = _make_source(db, "b2")
     # claim belongs to ws_b
-    claim_b = Claim(
-        workspace_id=ws_b.id, subject_key="s-b11-c", field_key="f1"
-    )
+    claim_b = Claim(workspace_id=ws_b.id, subject_key="s-b11-c", field_key="f1")
     db.add(claim_b)
     db.flush()
 

@@ -51,13 +51,22 @@ from app.database.models import (
     ClaimVersion,
     GenerationClaimVersion,
     MemoryGeneration,
+    MemorySecurityAudit,
     MemoryWorkspace,
+    Source,
 )
 from app.memory.policy import (
+    POLICY_VERSION,
     MemoryPolicyContext,
     MemoryTrustPolicy,
     Operation,
     TrustLevel,
+)
+from app.memory.security import (
+    ActorRole,
+    AuthorizationContext,
+    AuthorizationDeniedError,
+    require_authorization,
 )
 
 # ---------------------------------------------------------------------------
@@ -408,3 +417,204 @@ class MemoryGateway:
         # Atomicity is finalized by the caller's transaction commit.
         self._session.flush()
         return ws
+
+    def _lock_security_workspace(self, ctx: WorkspaceContext) -> MemoryWorkspace:
+        ws = self._session.scalar(
+            select(MemoryWorkspace)
+            .where(MemoryWorkspace.id == ctx.workspace_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if ws is None or ws.workspace_key != ctx.workspace_key:
+            raise WorkspaceNotFoundError("Invalid workspace context.")
+        return ws
+
+    def _record_security_change(
+        self,
+        ws: MemoryWorkspace,
+        actor: AuthorizationContext,
+        operation: str,
+        target_id: str,
+        old_status: str,
+        new_status: str,
+        reason: str,
+    ) -> None:
+        self._session.add(
+            MemorySecurityAudit(
+                workspace_id=ws.id,
+                actor_id=actor.actor_id,
+                actor_role=actor.role.value,
+                operation=operation,
+                target_id=target_id,
+                old_status=old_status,
+                new_status=new_status,
+                reason=reason,
+                policy_version=POLICY_VERSION,
+            )
+        )
+
+    def _invalidate_active_generation(self, ws: MemoryWorkspace) -> None:
+        if ws.active_generation_id is not None:
+            previous = self._session.get(MemoryGeneration, ws.active_generation_id)
+            if previous is not None and previous.state == "active":
+                previous.state = "retired"
+            ws.active_generation_id = None
+
+    def set_claim_visibility(
+        self,
+        ctx: WorkspaceContext,
+        version_id: str,
+        status: str,
+        actor: AuthorizationContext,
+        reason: str,
+    ) -> ClaimVersion:
+        """Authorized quarantine or release of a claim version."""
+        if status not in {"eligible", "quarantined"}:
+            raise ValueError("Unsupported visibility transition.")
+        if not reason.strip():
+            raise ValueError("A review reason is required.")
+
+        allowed_roles = (
+            frozenset({ActorRole.REVIEWER})
+            if status == "eligible"
+            else frozenset(
+                {
+                    ActorRole.REVIEWER,
+                    ActorRole.RECOVERY_SERVICE,
+                }
+            )
+        )
+        require_authorization(actor, ctx.workspace_id, allowed_roles)
+
+        ws = self._lock_security_workspace(ctx)
+
+        version = self._session.scalar(
+            select(ClaimVersion)
+            .join(Claim, Claim.id == ClaimVersion.claim_id)
+            .where(
+                ClaimVersion.id == version_id,
+                Claim.workspace_id == ws.id,
+            )
+            .with_for_update(of=ClaimVersion)
+            .execution_options(populate_existing=True)
+        )
+        if version is None:
+            raise CrossWorkspaceError("Claim version is unavailable in this workspace.")
+
+        old_status = version.visibility_status
+        if old_status == status:
+            raise ValueError("Claim version already has this status.")
+
+        if status == "eligible":
+            source = self._session.get(Source, version.source_id)
+            if (
+                version.trust_status != "verified"
+                or source is None
+                or source.trust_status != "verified"
+                or old_status != "quarantined"
+            ):
+                raise PolicyDeniedError(
+                    "Release requires verified source and claim evidence."
+                )
+
+        version.visibility_status = status
+
+        if status == "quarantined":
+            # Fail closed: retire active memory, which may depend
+            # on this version. Future recovery rebuilds a candidate.
+            self._invalidate_active_generation(ws)
+
+        ws.revision += 1
+        self._record_security_change(
+            ws,
+            actor,
+            "set_claim_visibility",
+            version.id,
+            old_status,
+            status,
+            reason,
+        )
+        self._session.flush()
+        return version
+
+    def review_source_trust(
+        self,
+        ctx: WorkspaceContext,
+        source_id: str,
+        status: str,
+        actor: AuthorizationContext,
+        reason: str,
+        evidence_reference: str,
+    ) -> Source:
+        """Reviewer-authorized source trust assessment.
+
+        Source records are globally shared in the existing schema.
+        Until sources are workspace-owned, a source referenced by
+        multiple workspaces cannot be reviewed using this method.
+        """
+        if status not in {"verified", "disputed"}:
+            raise ValueError("Unsupported source trust transition.")
+        if not reason.strip() or not evidence_reference.strip():
+            raise ValueError("Review reason and evidence reference are required.")
+
+        require_authorization(
+            actor,
+            ctx.workspace_id,
+            frozenset({ActorRole.REVIEWER}),
+        )
+        ws = self._lock_security_workspace(ctx)
+
+        linked_workspace_ids = set(
+            self._session.scalars(
+                select(Claim.workspace_id)
+                .join(
+                    ClaimVersion,
+                    ClaimVersion.claim_id == Claim.id,
+                )
+                .where(ClaimVersion.source_id == source_id)
+                .distinct()
+            ).all()
+        )
+        if linked_workspace_ids != {ws.id}:
+            raise AuthorizationDeniedError(
+                "Source must belong exclusively to this workspace."
+            )
+
+        source = self._session.scalar(
+            select(Source)
+            .where(Source.id == source_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if source is None:
+            raise ValueError("Source not found.")
+
+        old_status = source.trust_status
+        if old_status == status:
+            raise ValueError("Source already has this trust status.")
+
+        source.trust_status = status
+
+        if status == "disputed":
+            versions = self._session.scalars(
+                select(ClaimVersion)
+                .where(ClaimVersion.source_id == source_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            ).all()
+            for version in versions:
+                version.visibility_status = "quarantined"
+            self._invalidate_active_generation(ws)
+
+        ws.revision += 1
+        self._record_security_change(
+            ws,
+            actor,
+            "review_source_trust",
+            source.id,
+            old_status,
+            status,
+            f"{reason}; evidence={evidence_reference}",
+        )
+        self._session.flush()
+        return source

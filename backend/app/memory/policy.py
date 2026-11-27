@@ -85,3 +85,6 @@ class MemoryTrustPolicy:
             allowed=False,
             reason="Unsupported operation.",
         )
+
+
+POLICY_VERSION = "b1.4-v1"

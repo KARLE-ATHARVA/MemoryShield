@@ -420,3 +420,25 @@ class RecoveryJob(Base):
             name="ck_recovery_job_status",
         ),
     )
+
+
+class MemorySecurityAudit(Base):
+    """Append-only record of completed privileged memory operations."""
+
+    __tablename__ = "memory_security_audit"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    workspace_id: Mapped[str] = mapped_column(
+        ForeignKey("memory_workspaces.id"), nullable=False
+    )
+    actor_id: Mapped[str] = mapped_column(String(150))
+    actor_role: Mapped[str] = mapped_column(String(40))
+    operation: Mapped[str] = mapped_column(String(60))
+    target_id: Mapped[str] = mapped_column(String(36))
+    old_status: Mapped[str] = mapped_column(String(40))
+    new_status: Mapped[str] = mapped_column(String(40))
+    reason: Mapped[str] = mapped_column(Text)
+    policy_version: Mapped[str] = mapped_column(String(40))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now
+    )
