@@ -345,10 +345,11 @@ class MemoryGateway:
                 "Workspace context does not match the database."
             )
 
-        generation = self._session.get(
-            MemoryGeneration,
-            generation_id,
-            populate_existing=True,
+        generation = self._session.scalar(
+            select(MemoryGeneration)
+            .where(MemoryGeneration.id == generation_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
         if generation is None:
             raise ValueError("Candidate generation not found.")
@@ -371,39 +372,57 @@ class MemoryGateway:
                 f"current revision {ws.revision}."
             )
 
+        # Lock the candidate membership before validating its evidence.
         memberships = self._session.scalars(
-            select(GenerationClaimVersion).where(
-                GenerationClaimVersion.generation_id == generation.id
-            )
+            select(GenerationClaimVersion)
+            .where(GenerationClaimVersion.generation_id == generation.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         ).all()
 
         for membership in memberships:
-            version = self._session.get(
-                ClaimVersion,
-                membership.version_id,
-                populate_existing=True,
+            version = self._session.scalar(
+                select(ClaimVersion)
+                .where(ClaimVersion.id == membership.version_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
             )
             if version is None:
                 raise ValueError("Candidate references missing evidence.")
-
-            if version.visibility_status != "eligible" or version.trust_status not in (
-                "verified",
-                "provisional",
-            ):
-                raise PolicyDeniedError(
-                    "Candidate contains an ineligible claim version."
-                )
-
-            if version.trust_status == "provisional" and not sandbox_mode:
-                raise PolicyDeniedError(
-                    "Provisional memory requires isolated sandbox mode."
-                )
 
             if (
                 membership.workspace_id != ws.id
                 or membership.claim_id != version.claim_id
             ):
                 raise CrossWorkspaceError("Candidate membership ownership mismatch.")
+
+            if version.visibility_status != "eligible":
+                raise PolicyDeniedError(
+                    "Candidate contains quarantined or superseded evidence."
+                )
+
+            if version.trust_status not in ("verified", "provisional"):
+                raise PolicyDeniedError("Candidate contains untrusted evidence.")
+
+            source = self._session.scalar(
+                select(Source)
+                .where(Source.id == version.source_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+            if source is None:
+                raise PolicyDeniedError("Source evidence is missing.")
+
+            if source.trust_status in ("unverified", "disputed"):
+                raise PolicyDeniedError(
+                    "Candidate references an untrusted or disputed source."
+                )
+
+            if (
+                version.trust_status == "provisional"
+                or source.trust_status == "provisional"
+            ) and not sandbox_mode:
+                raise PolicyDeniedError("Provisional evidence requires sandbox mode.")
 
         if ws.active_generation_id is not None:
             previous = self._session.get(MemoryGeneration, ws.active_generation_id)

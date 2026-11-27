@@ -265,3 +265,36 @@ def test_two_transactions_cannot_activate_stale_candidates():
                     session.delete(workspace)
 
         engine.dispose()
+
+
+@pytest.mark.integration
+def test_activation_rollback_preserves_previous_generation(db):
+    gateway, ctx, version = setup_memory(db)
+
+    first = gateway.create_candidate_generation(ctx, [version.id])
+    gateway.activate_generation(
+        ctx,
+        first.id,
+        source_trust=TrustLevel.VERIFIED,
+    )
+
+    second = gateway.create_candidate_generation(ctx, [version.id])
+
+    with pytest.raises(RuntimeError, match="simulated failure"), db.begin_nested():
+        gateway.activate_generation(
+            ctx,
+            second.id,
+            source_trust=TrustLevel.VERIFIED,
+        )
+        raise RuntimeError("simulated failure")
+
+    db.expire_all()
+
+    workspace = db.get(MemoryWorkspace, ctx.workspace_id)
+    original = db.get(MemoryGeneration, first.id)
+    candidate = db.get(MemoryGeneration, second.id)
+
+    assert workspace.active_generation_id == first.id
+    assert workspace.revision == 1
+    assert original.state == "active"
+    assert candidate.state == "candidate"
