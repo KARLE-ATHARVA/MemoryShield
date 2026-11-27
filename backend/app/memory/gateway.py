@@ -42,6 +42,7 @@ No supplier names, field keys, or domain-specific constants appear here.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from hashlib import sha256
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -635,5 +636,69 @@ class MemoryGateway:
             status,
             f"{reason}; evidence={evidence_reference}",
         )
+        self._session.flush()
+        return source
+
+    def register_source(
+        self,
+        ctx: WorkspaceContext,
+        filename: str,
+        source_type: str,
+        content: bytes,
+    ) -> Source:
+        """Register source metadata with a server-computed SHA-256 digest.
+
+        Does not persist raw document bytes. The caller owns the transaction.
+        New sources begin unverified.
+        """
+        if not isinstance(content, bytes):
+            raise TypeError("Source content must be bytes.")
+
+        if not content:
+            raise ValueError("Source content cannot be empty.")
+
+        if len(content) > 5 * 1024 * 1024:
+            raise ValueError("Source exceeds the 5 MiB registration limit.")
+
+        if (
+            not filename
+            or len(filename) > 255
+            or "/" in filename
+            or "\\" in filename
+            or any(ord(char) < 32 for char in filename)
+        ):
+            raise ValueError("Invalid source filename.")
+
+        if source_type not in {"document", "observation"}:
+            raise ValueError("Unsupported source type.")
+
+        workspace = self._session.get(
+            MemoryWorkspace,
+            ctx.workspace_id,
+            populate_existing=True,
+        )
+        if workspace is None or workspace.workspace_key != ctx.workspace_key:
+            raise WorkspaceNotFoundError("Invalid workspace context.")
+
+        digest = sha256(content).hexdigest()
+
+        existing = self._session.scalar(
+            select(Source).where(
+                Source.workspace_id == workspace.id,
+                Source.sha256 == digest,
+            )
+        )
+        if existing is not None:
+            return existing
+
+        source = Source(
+            workspace_id=workspace.id,
+            filename=filename,
+            source_type=source_type,
+            sha256=digest,
+            trust_status="unverified",
+        )
+
+        self._session.add(source)
         self._session.flush()
         return source

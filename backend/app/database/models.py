@@ -75,6 +75,9 @@ class Source(Base):
     __tablename__ = "sources"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    workspace_id: Mapped[str | None] = mapped_column(
+        ForeignKey("memory_workspaces.id"), nullable=True
+    )
     filename: Mapped[str] = mapped_column(String(255))
     source_type: Mapped[str] = mapped_column(String(50))
     sha256: Mapped[str] = mapped_column(String(64))
@@ -84,6 +87,11 @@ class Source(Base):
     )
 
     __table_args__ = (
+        UniqueConstraint(
+            "workspace_id",
+            "sha256",
+            name="uq_source_workspace_sha256",
+        ),
         CheckConstraint(
             "trust_status IN ('unverified', 'provisional', 'verified', 'disputed')",
             name="ck_source_trust",
