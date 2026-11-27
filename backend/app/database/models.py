@@ -40,9 +40,7 @@ class MemoryWorkspace(Base):
     # → memory_generations(id, workspace_id), which guarantees that the activated
     # generation belongs to this workspace.  The simple ForeignKey annotation is
     # intentionally absent here; the constraint lives in __table_args__ below.
-    active_generation_id: Mapped[str | None] = mapped_column(
-        String(36), nullable=True
-    )
+    active_generation_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     revision: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now
@@ -290,6 +288,7 @@ class MemoryGeneration(Base):
         ForeignKey("memory_workspaces.id"), nullable=False
     )
     state: Mapped[str] = mapped_column(String(30), default="candidate")
+    base_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now
     )
@@ -300,6 +299,10 @@ class MemoryGeneration(Base):
     )
 
     __table_args__ = (
+        CheckConstraint(
+            "base_revision IS NULL OR base_revision >= 0",
+            name="ck_generation_base_revision_nonnegative",
+        ),
         CheckConstraint(
             "state IN ('candidate', 'active', 'retired')",
             name="ck_generation_state",

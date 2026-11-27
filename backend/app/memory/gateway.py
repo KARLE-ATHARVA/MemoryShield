@@ -273,9 +273,14 @@ class MemoryGateway:
                     f"ClaimVersion '{vid}' belongs to a different workspace."
                 )
 
+        workspace = self._session.get(MemoryWorkspace, ctx.workspace_id)
+        if workspace is None:
+            raise WorkspaceNotFoundError(f"Workspace '{ctx.workspace_id}' not found.")
+
         generation = MemoryGeneration(
             workspace_id=ctx.workspace_id,
             state="candidate",
+            base_revision=workspace.revision,
         )
         self._session.add(generation)
         self._session.flush()
@@ -303,28 +308,11 @@ class MemoryGateway:
         authorized_approval: bool = False,
         sandbox_mode: bool = False,
     ) -> MemoryWorkspace:
-        """Activate a candidate generation as the workspace's active memory.
+        """Atomically stage activation of a current candidate.
 
-        The generation must belong to ``ctx.workspace_id``.
-
-        A ``PolicyDeniedError`` is raised if the trust policy rejects
-        activation.  A ``StaleWorkspaceError`` is raised if the workspace
-        revision has changed since the caller last read it (optimistic lock).
-
-        Parameters
-        ----------
-        ctx:
-            Resolved workspace context.
-        generation_id:
-            ID of the candidate generation to activate.
-        source_trust:
-            Trust level of the evidence supporting this activation.
-        authorized_approval:
-            Whether an authorised human or system approval is present.
-        sandbox_mode:
-            Whether activation is occurring inside an isolated sandbox.
+        The caller owns the Session transaction and must commit or
+        roll back the entire operation. No commit occurs here.
         """
-        # Policy check.
         decision = self._policy.evaluate(
             MemoryPolicyContext(
                 operation=Operation.ACTIVATE,
@@ -336,37 +324,87 @@ class MemoryGateway:
         if not decision.allowed:
             raise PolicyDeniedError(decision.reason)
 
-        # Load the generation and verify workspace ownership.
-        generation = self._session.get(MemoryGeneration, generation_id)
-        if generation is None:
-            raise ValueError(f"MemoryGeneration '{generation_id}' not found.")
-        if generation.workspace_id != ctx.workspace_id:
-            raise CrossWorkspaceError(
-                f"Generation '{generation_id}' belongs to a different workspace."
-            )
-        if generation.state != "candidate":
-            raise ValueError(
-                f"Only candidate generations can be activated; "
-                f"current state is '{generation.state}'."
-            )
-
-        # Load workspace with optimistic lock.
-        ws = self._session.get(MemoryWorkspace, ctx.workspace_id)
-        if ws is None:
+        # Lock and refresh the workspace before reading its revision.
+        ws = self._session.scalar(
+            select(MemoryWorkspace)
+            .where(MemoryWorkspace.id == ctx.workspace_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if ws is None or ws.workspace_key != ctx.workspace_key:
             raise WorkspaceNotFoundError(
-                f"Workspace '{ctx.workspace_id}' disappeared unexpectedly."
+                "Workspace context does not match the database."
             )
 
-        # Retire the current active generation if one exists.
-        if ws.active_generation_id is not None:
-            current = self._session.get(MemoryGeneration, ws.active_generation_id)
-            if current is not None and current.state == "active":
-                current.state = "retired"
+        generation = self._session.get(
+            MemoryGeneration,
+            generation_id,
+            populate_existing=True,
+        )
+        if generation is None:
+            raise ValueError("Candidate generation not found.")
 
-        # Activate.
+        if generation.workspace_id != ws.id:
+            raise CrossWorkspaceError("Candidate belongs to another workspace.")
+
+        if generation.state != "candidate":
+            raise ValueError("Only candidate generations can be activated.")
+
+        if generation.base_revision is None:
+            raise StaleWorkspaceError(
+                "Candidate has no recorded base revision; rebuild it."
+            )
+
+        if generation.base_revision != ws.revision:
+            raise StaleWorkspaceError(
+                "Candidate is stale: "
+                f"base revision {generation.base_revision}, "
+                f"current revision {ws.revision}."
+            )
+
+        memberships = self._session.scalars(
+            select(GenerationClaimVersion).where(
+                GenerationClaimVersion.generation_id == generation.id
+            )
+        ).all()
+
+        for membership in memberships:
+            version = self._session.get(
+                ClaimVersion,
+                membership.version_id,
+                populate_existing=True,
+            )
+            if version is None:
+                raise ValueError("Candidate references missing evidence.")
+
+            if version.visibility_status != "eligible" or version.trust_status not in (
+                "verified",
+                "provisional",
+            ):
+                raise PolicyDeniedError(
+                    "Candidate contains an ineligible claim version."
+                )
+
+            if version.trust_status == "provisional" and not sandbox_mode:
+                raise PolicyDeniedError(
+                    "Provisional memory requires isolated sandbox mode."
+                )
+
+            if (
+                membership.workspace_id != ws.id
+                or membership.claim_id != version.claim_id
+            ):
+                raise CrossWorkspaceError("Candidate membership ownership mismatch.")
+
+        if ws.active_generation_id is not None:
+            previous = self._session.get(MemoryGeneration, ws.active_generation_id)
+            if previous is not None and previous.state == "active":
+                previous.state = "retired"
+
         generation.state = "active"
         ws.active_generation_id = generation.id
         ws.revision += 1
 
+        # Atomicity is finalized by the caller's transaction commit.
         self._session.flush()
         return ws
